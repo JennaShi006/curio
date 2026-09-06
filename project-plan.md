@@ -25,7 +25,8 @@ competitors (Rankd, Trove):
 - **AI/ML:** UF NaviGator AI Toolkit (embeddings + LLM calls) for prototyping;
   abstracted behind an internal provider interface so it can be swapped for
   a production provider (OpenAI/Anthropic/self-hosted) later
-- **Auth:** JWT-based
+- **Auth:** Neon Auth (managed, backed by the same Neon Postgres project as
+  the database — see Phase 1 Implementation Plan for details)
 - **Background jobs:** Celery + Redis (for staleness refresh jobs, not for
   scheduled polling of search — see Feature 3)
 
@@ -55,7 +56,8 @@ competitors (Rankd, Trove):
 - Postgres schema: `users`, `media_items`, `user_rankings`, `comparisons`,
   `watchlist`
 - pgvector extension enabled, embedding column on `media_items`
-- Basic JWT auth (signup/login)
+- Auth via Neon Auth (signup/login UI handled by Neon Auth's SDK; backend
+  verifies Neon-issued JWTs rather than owning credentials itself)
 
 **2. External metadata search (single-source first)**
 - TMDB integration: search movies + TV (multi-search endpoint)
@@ -83,6 +85,19 @@ competitors (Rankd, Trove):
   discoverable, but its body is a no-op/TODO. Real sweep logic deferred to a
   later pass.
 - TMDB API key already obtained; plan only documents the env var.
+- **Database + Auth hosting:** Postgres and auth are provisioned on Neon
+  (project `dry-king-34703897`, branch `production`), not the local
+  `docker-compose` Postgres container described below — the repo is linked
+  via the `neon` CLI (`neon link`) and `neon.ts` (`auth: true`), which pulls
+  `DATABASE_URL`, `DATABASE_URL_UNPOOLED`, `NEON_AUTH_BASE_URL`, and
+  `NEON_AUTH_JWKS_URL` into the root `.env`. Redis (for the Phase 1 Celery
+  stub) still runs via local `docker-compose` for now — Upstash is the
+  intended target once the caching/Celery work actually resumes, deferred
+  per current scope.
+- **Auth: Neon Auth**, not self-issued JWTs. Chosen over the originally
+  planned custom `passlib[bcrypt]` signup/login (see superseded assumption
+  below) to get social login/password-reset for free and skip owning
+  credential storage, accepting the Neon coupling as a deliberate trade-off.
 
 **Flagged assumptions (reasonable defaults, cheap to revisit, not blocking):**
 - Embedding column: `vector(1536)` placeholder (OpenAI-style dimension) until
@@ -90,8 +105,12 @@ competitors (Rankd, Trove):
   Changing it later is a one-column Alembic migration.
 - Staleness thresholds (tunable via env): upcoming 3 days, airing 7 days,
   completed 90 days — well under TMDB's 6-month cache cap.
-- Auth: HS256 JWT, symmetric secret, 7-day expiry, no refresh-token flow.
-  Passwords hashed via `passlib[bcrypt]`.
+- ~~Auth: HS256 JWT, symmetric secret, 7-day expiry, passwords hashed via
+  `passlib[bcrypt]`~~ — superseded by the Neon Auth decision above.
+- Exact Neon Auth React SDK integration for a plain Vite app (not Next.js) —
+  component/hook names and frontend publishable-key env var(s) — is
+  unconfirmed; verify against Neon Auth's current React docs before wiring
+  the frontend (Phase 1 build order step 9).
 - TMDB search-result status mapping is coarse (search/multi-search doesn't
   return the full `status` field) — refine via detail-endpoint calls later
   if needed.
@@ -111,23 +130,22 @@ curio/
 │       ├── main.py             # FastAPI app, router includes, CORS
 │       ├── config.py           # pydantic-settings
 │       ├── db.py                # SQLAlchemy engine/session
-│       ├── models/             # users, media_item, user_ranking, comparison, watchlist
-│       ├── schemas/             # auth.py, media_item.py (normalized MediaItem), user.py
-│       ├── routers/             # auth.py, search.py
+│       ├── models/             # users (app profile only), media_item, user_ranking, comparison, watchlist
+│       ├── schemas/             # media_item.py (normalized MediaItem), user.py
+│       ├── routers/             # search.py (no auth.py — Neon Auth owns signup/login)
 │       ├── services/
-│       │   ├── auth_service.py
 │       │   ├── external/       # tmdb.py, open_library.py
 │       │   ├── cache/          # media_cache.py
 │       │   └── ai/             # RESERVED SEAM for Phase 4 — empty provider.py stub only
-│       ├── core/security.py    # JWT encode/decode, get_current_user dependency
+│       ├── core/security.py    # verifies Neon Auth JWTs via NEON_AUTH_JWKS_URL, get_current_user dependency
 │       └── workers/            # celery_app.py, tasks.py (stub sweep task)
 └── frontend/
-    ├── package.json            # Vite + React + TS
+    ├── package.json            # Vite + React + TS + Neon Auth SDK
     └── src/
-        ├── api/                # client.ts, auth.ts, search.ts
-        ├── pages/               # LoginPage, SignupPage, SearchPage
+        ├── api/                # client.ts, search.ts
+        ├── pages/               # SearchPage (login/signup rendered by Neon Auth's own components)
         ├── components/          # SearchBar, MediaResultCard, Footer (TMDB attribution)
-        └── context/AuthContext.tsx
+        └── context/AuthContext.tsx  # thin wrapper over Neon Auth's session/hooks
 ```
 Standard FastAPI layering (routers/models/schemas/services) — chosen so
 Phase 2's comparison engine and Phase 3's unified search just add files into
@@ -141,8 +159,13 @@ needed since backend/frontend aren't containerized.
 
 **Postgres schema** (5 tables, uuid PKs via `gen_random_uuid()`, `timestamptz`
 timestamps):
-- `users` — id, email (unique), hashed_password, display_name (nullable),
-  created_at, updated_at.
+- `users` — app-profile table, no longer credential-owning. `id` matches the
+  Neon Auth user id (created lazily on first authenticated request, not
+  self-generated); display_name (nullable); created_at, updated_at. Email
+  and credentials live in Neon Auth's own synced table
+  (`neon_auth.users_sync` in the same Postgres database), not duplicated
+  here — join against it if email is needed in a query. No `hashed_password`
+  column.
 - `media_items` — id, media_type (`movie|tv|book`, CHECK not native enum —
   easier to extend later), external_source (`tmdb|open_library`),
   external_id, title, synopsis, release_date (nullable), status
@@ -171,11 +194,14 @@ a hardcoded ini value. Write SQLAlchemy models first, then
 `alembic revision --autogenerate`, review the diff, apply with
 `alembic upgrade head`.
 
-**JWT auth:** `POST /auth/signup` (email, password, display_name?) and
-`POST /auth/login` (email, password), both issuing a token.
-`core/security.py` holds `create_access_token`, `decode_access_token`, and a
-`get_current_user` FastAPI dependency reusable by all future protected
-routes. Passwords hashed via `passlib[bcrypt]`.
+**Auth (Neon Auth):** no custom signup/login endpoints — Neon Auth's SDK
+handles the signup/login UI on the frontend directly and issues the session
+JWT. `core/security.py` holds a `get_current_user` FastAPI dependency that
+verifies incoming JWTs against `NEON_AUTH_JWKS_URL` (already pulled into
+`.env` by `neon link`/`neon deploy`), extracts the Neon Auth user id from the
+token's `sub` claim, and upserts a matching row into the app's `users` table
+on first sight (lazy profile creation) — reusable by all future protected
+routes. No `passlib`/bcrypt, no self-issued tokens, no `JWT_SECRET`.
 
 **External API integration:** a normalized `MediaItem` pydantic schema
 (`schemas/media_item.py` — media_type, external_source, external_id, title,
@@ -214,33 +240,46 @@ change is needed later, only a possible dimension adjustment.
 **Frontend (prove the loop, not the real UI):** Vite + React + TypeScript,
 no state-management library yet (plain `fetch` + `useState`/`useEffect`
 suffices; introduce React Query when Phase 2/3 interactions get more
-complex). `LoginPage`/`SignupPage` (JWT stored in localStorage for the
-prototype), `AuthContext` + route guard, `SearchPage` (one search bar, two
-result sections hitting the two separate endpoints), and a global `Footer`
-carrying the required TMDB attribution text: *"This product uses the TMDB
-API but is not endorsed or certified by TMDB."*
+complex). Neon Auth's React SDK provides the signup/login UI and session
+state directly — no hand-built `LoginPage`/`SignupPage` forms; `AuthContext`
+becomes a thin wrapper exposing the Neon Auth session (and its JWT, attached
+to API calls) plus a route guard. `SearchPage` (one search bar, two result
+sections hitting the two separate endpoints) and a global `Footer` carrying
+the required TMDB attribution text: *"This product uses the TMDB API but is
+not endorsed or certified by TMDB."* **Open item:** confirm Neon Auth's
+exact React SDK usage for a plain Vite app before building this (see flagged
+assumption above).
 
 **Environment variables:**
-- Root `.env` (docker-compose): `POSTGRES_USER`, `POSTGRES_PASSWORD`,
-  `POSTGRES_DB`.
-- `backend/.env`: `DATABASE_URL`, `REDIS_URL`, `JWT_SECRET`,
-  `JWT_ALGORITHM=HS256`, `JWT_EXPIRE_MINUTES`, `TMDB_API_KEY`,
+- Root `.env` (docker-compose, for local Redis; Postgres now comes from
+  Neon, see above): `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB` —
+  plus, pulled in automatically by `neon link`/`neon deploy`: `DATABASE_URL`,
+  `DATABASE_URL_UNPOOLED`, `NEON_BRANCH`, `NEON_AUTH_BASE_URL`,
+  `NEON_AUTH_JWKS_URL`.
+- `backend/.env`: `DATABASE_URL` (from Neon), `REDIS_URL`,
+  `NEON_AUTH_JWKS_URL` (from Neon), `TMDB_API_KEY`,
   `STALENESS_UPCOMING_DAYS`, `STALENESS_AIRING_DAYS`,
-  `STALENESS_COMPLETED_DAYS`.
-- `frontend/.env`: `VITE_API_BASE_URL`.
+  `STALENESS_COMPLETED_DAYS`. No `JWT_SECRET`/`JWT_ALGORITHM`/
+  `JWT_EXPIRE_MINUTES` — tokens are issued and signed by Neon Auth, not
+  self-issued.
+- `frontend/.env`: `VITE_API_BASE_URL`, plus whichever Neon Auth
+  frontend/publishable key its React SDK requires (name TBD — flagged
+  assumption above).
 - All real `.env` files gitignored; only `.env.example` files committed.
   Open Library needs no key.
 
 **Suggested build order:**
-1. `docker-compose.yml` + root `.env.example` → bring up Postgres/Redis,
-   verify connectivity before writing app code.
+1. `docker-compose.yml` + root `.env.example` → bring up Redis (Postgres now
+   comes from the linked Neon project instead of a local container), verify
+   connectivity before writing app code.
 2. `backend/` scaffold: `uv init`, add deps (fastapi, uvicorn, sqlalchemy,
-   alembic, psycopg[binary], pgvector, passlib[bcrypt], pyjwt,
-   pydantic-settings, celery, redis).
+   alembic, psycopg[binary], pgvector, pyjwt, pydantic-settings, celery,
+   redis) — `passlib[bcrypt]` no longer needed, Neon Auth owns credentials.
 3. SQLAlchemy models → Alembic autogenerate → `alembic upgrade head` →
    verify schema in DB.
-4. Auth: `security.py`, `auth_service.py`, `routers/auth.py` → verify via
-   `/docs`.
+4. Auth: `core/security.py`'s `get_current_user` dependency verifying
+   Neon-issued JWTs via `NEON_AUTH_JWKS_URL` → verify by hitting a
+   protected route with/without a valid token.
 5. Normalized `MediaItem` schema → TMDB client → Open Library client (test
    independently before wiring caching).
 6. Caching layer → wire into `routers/search.py`.
@@ -251,17 +290,24 @@ API but is not endorsed or certified by TMDB."*
 10. Full end-to-end verification pass (below).
 
 **Verification plan (end-to-end):**
-1. `docker compose up -d` → confirm `curio-postgres`/`curio-redis` healthy.
-2. `cd backend && uv sync && uv run alembic upgrade head` → confirm all 5
-   tables exist, `vector` extension enabled (`\dx`), `media_items.embedding`
-   is `vector(1536)`.
-3. `uv run uvicorn app.main:app --reload` → `/docs` shows `auth` and
-   `search` routers.
-4. `cd frontend && npm install && npm run dev` → `/login` loads.
-5. Signup via UI or `curl` → 200 + JWT returned, `users` row has a bcrypt
-   hash (not plaintext).
-6. Log out, log back in → token issued for the same user.
-7. Hitting `/search` while logged out redirects to `/login`.
+1. `docker compose up -d` → confirm `curio-redis` healthy (Postgres is the
+   Neon `production` branch, already live — confirm with `neon` CLI or
+   console instead of a local container check).
+2. `cd backend && uv sync && uv run alembic upgrade head` (against the Neon
+   `DATABASE_URL`) → confirm all 5 tables exist, `vector` extension enabled
+   (`\dx`), `media_items.embedding` is `vector(1536)`.
+3. `uv run uvicorn app.main:app --reload` → `/docs` shows the `search`
+   router (no `auth` router — Neon Auth handles that outside this backend).
+4. `cd frontend && npm install && npm run dev` → the Neon Auth signup/login
+   UI loads.
+5. Signup via the Neon Auth UI → confirm a row appears in
+   `neon_auth.users_sync`, and a corresponding lazily-created row appears in
+   the app's own `users` table on first authenticated backend call.
+6. Log out, log back in → same Neon Auth user, same app-side `users` row
+   (no duplicate created).
+7. Hitting `/search` while logged out returns 401 (or the frontend redirects
+   to Neon Auth's login), proving `get_current_user`'s JWKS verification
+   actually gates the route.
 8. Search a movie/show (e.g. "Dune") → results render; `media_items` rows
    inserted with `external_source='tmdb'`.
 9. Search a book (e.g. "Dune") → results render; rows inserted with

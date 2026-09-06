@@ -1,0 +1,68 @@
+@import url('https://fonts.googleapis.com/css2?family=Akaya+Telivigala&family=Fraunces:ital,opsz,wght@0,9..144,300;0,9..144,400;1,9..144,300;1,9..144,400&family=Instrument+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap');
+@import 'tailwindcss';
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-border: var(--border);
+  --color-ring: var(--ring);
+  --radius-sm: calc(var(--radius) - 2px);
+  --radius-md: var(--radius);
+  --radius-lg: calc(var(--radius) + 4px);
+  --font-sans: 'Instrument Sans', sans-serif;
+  --font-serif: 'Fraunces', serif;
+  --font-mono: 'JetBrains Mono', monospace;
+}
+
+:root {
+  --dry-sage: #c9cba3ff;
+  --soft-peach: #ffe1a8ff;
+  --vibrant-coral: #e26d5cff;
+  --wine-plum: #723d46ff;
+  --deep-mocha: #472d30ff;
+
+  --background: #fdf6ee;
+  --foreground: #472d30;
+  --card: #fffaf4;
+  --card-foreground: #472d30;
+  --primary: #e26d5c;
+  --primary-foreground: #fffaf4;
+  --secondary: #ffe1a8;
+  --secondary-foreground: #472d30;
+  --muted: #ede8d8;
+  --muted-foreground: #723d46;
+  --accent: #c9cba3;
+  --accent-foreground: #472d30;
+  --border: #ddd4b8;
+  --ring: #e26d5c;
+  --radius: 6px;
+}
+
+html, body, #root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background-color: var(--background);
+  color: var(--foreground);
+  font-family: 'Instrument Sans', sans-serif;
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: transparent transparent;
+}
+*:hover {
+  scrollbar-color: var(--border) transparent;
+}
